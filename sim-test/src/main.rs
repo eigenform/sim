@@ -1,7 +1,6 @@
 
 use sim_macros::*;
 use sim::*;
-use sim;
 
 pub trait Addable: Sized + std::ops::Add<Output=Self> + Copy {
 }
@@ -48,6 +47,15 @@ impl Combinational for MyAdderReg {
         let out = self.s.sample();
         self.output.drive(out);
     }
+}
+
+#[derive(Module)]
+#[derive(Debug)]
+pub struct MyTopModule {
+    #[output]
+    x: Signal<usize>,
+    #[clocked]
+    adder: MyAdder,
 }
 
 

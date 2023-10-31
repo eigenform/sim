@@ -6,18 +6,30 @@ use syn::punctuated::*;
 use syn::token::*;
 use quote::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FieldKind {
-    Input, Output, Clocked, Memory, None
-}
-struct FieldInfo {
-    name: syn::Ident,
-    ty: syn::Type,
-    inner_ty: syn::Type,
-    kind: FieldKind,
+enum ModuleField {
+    Input(SignalInfo),
+    Output(SignalInfo),
+    Clocked(ClockedInfo),
+    Submodule(SubmoduleInfo),
+    Other,
 }
 
-fn extract_concrete_type(name: &syn::Ident, ty: &syn::Type) -> syn::Type {
+struct ClockedInfo {
+    name: syn::Ident,
+    ty: syn::Type,
+    //inner_ty: syn::Type,
+}
+struct SubmoduleInfo {
+    name: syn::Ident,
+    ty: syn::Type,
+}
+struct SignalInfo {
+    name: syn::Ident,
+    inner_ty: syn::Type,
+}
+
+/// Get the concrete inner type of a Signal<T>
+fn extract_signal_type(name: &syn::Ident, ty: &syn::Type) -> syn::Type {
     let path = match ty {
         syn::Type::Path(ref typepath) if typepath.qself.is_none() => {
             &typepath.path
@@ -25,18 +37,18 @@ fn extract_concrete_type(name: &syn::Ident, ty: &syn::Type) -> syn::Type {
         _ => panic!("Couldn't get path for type"),
     };
 
-    let x = match path.segments.iter().filter(|t| {
-        t.ident == "Signal" || t.ident == "Register" || t.ident == "VecSignal"
-    }).last() {
+    let x = match path.segments.iter().filter(|t| { t.ident == "Signal" })
+        .last() 
+    {
         Some(s) => s,
-        _ => panic!("Field '{}' must be Signal<T> or Register<T>", name),
+        _ => panic!("Field '{}' must be Signal<T>", name),
     };
 
     match x.arguments {
         syn::PathArguments::AngleBracketed(ref params) => {
             match params.args.first() {
                 Some(syn::GenericArgument::Type(ref ty)) => ty.clone(),
-                _ => panic!("Field '{}' has invalid type paramers for '{}'", 
+                _ => panic!("Field '{}' has invalid type parameters for '{}'", 
                             name, x.ident),
             }
         },
@@ -44,72 +56,73 @@ fn extract_concrete_type(name: &syn::Ident, ty: &syn::Type) -> syn::Type {
     }
 }
 
-#[proc_macro_derive(Module, attributes(input, output, clocked, memory))]
+#[proc_macro_derive(Module, 
+    attributes(input, output, clocked, memory, submodule))]
 pub fn derive_module(tokens: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(tokens as syn::DeriveInput);
 
     let s: DataStruct = match ast.data {
         syn::Data::Struct(ref s) => s.clone(),
-        _ => panic!("Can only derive Module for structs"),
+        _ => panic!("Module can only be derived for structs"),
     };
     let struct_name = ast.ident;
     let (impl_generics, ty_generics, where_clause) = ast.generics.split_for_impl();
-
     let fields: Punctuated<Field, Comma> = match s.fields {
         syn::Fields::Named(FieldsNamed { ref named, ..}) => named.clone(),
-        _ => panic!("Can only derive Module for structs with named fields"),
+        _ => panic!("Module can only be derived for structs with named fields"),
     };
 
     // Capture information from all of the fields
-    let mut field_info = Vec::new();
+    let mut module_fields = Vec::new();
     for field in fields.iter() {
         let name = field.ident.clone().unwrap();
         let ty   = field.ty.clone();
-        let inner_ty = extract_concrete_type(&name, &ty);
-
-        let kind = {
-            let mut res = FieldKind::None;
-            for attr in field.attrs.iter() {
-                let attr_name = attr.path.get_ident().unwrap().to_string();
-                match attr_name.as_str() {
-                    "input" => { res = FieldKind::Input; break; },
-                    "output" => { res = FieldKind::Output; break; },
-                    "clocked" => { res = FieldKind::Clocked; break; },
-                    "memory" => { res = FieldKind::Memory; break; },
-                    _ => {},
-                }
-            }
-            res
+        let attr_string = if let Some(attr) = field.attrs.first() {
+            attr.path.get_ident().unwrap().to_string()
+        } else {
+            String::new()
         };
-        field_info.push(FieldInfo { 
-            name: field.ident.clone().unwrap().clone(),
-            ty: ty,
-            inner_ty: inner_ty,
-            kind, 
-        });
+        match attr_string.as_str() {
+            // Input and output are always Signal<T>
+            "input" => { 
+                let inner_ty = extract_signal_type(&name, &ty);
+                module_fields.push(ModuleField::Input(
+                    SignalInfo { name, inner_ty }
+                ));
+            },
+            "output" => { 
+                let inner_ty = extract_signal_type(&name, &ty);
+                module_fields.push(ModuleField::Output(
+                    SignalInfo { name, inner_ty }
+                ));
+            },
+            // Clocked components must implement Clocked
+            "clocked" => { 
+                module_fields.push(ModuleField::Clocked(
+                    ClockedInfo { name, ty }
+                ));
+            },
+            // Submodules must implement Module
+            "submodule" => { 
+            },
+            _ => {},
+        }
     }
 
     let mut output = TokenStream::new();
 
-    // Inputs
-    let names: Vec<_> = field_info.iter()
-        .filter(|f| f.kind == FieldKind::Input)
-        .map(|f| f.name.clone())
-        .collect();
-    let types: Vec<_> = field_info.iter()
-        .filter(|f| f.kind == FieldKind::Input)
-        .map(|f| f.ty.clone())
-        .collect();
-    let inner_types: Vec<_> = field_info.iter()
-        .filter(|f| f.kind == FieldKind::Input)
-        .map(|f| f.inner_ty.clone())
-        .collect();
-
-
     // Automatically implement public methods for driving input wires
-    let drive_fn_names: Vec<_> = field_info.iter()
-        .filter(|f| f.kind == FieldKind::Input)
-        .map(|f| format_ident!("drive_{}", f.name))
+    let inputs: Vec<_> = module_fields.iter().filter_map(|field| {
+        if let ModuleField::Input(info) = field { Some(info) } else { None }
+    }).collect();
+    let names: Vec<_> = inputs.iter()
+        .map(|info| info.name.clone())
+        .collect();
+    let inner_types: Vec<_> = inputs.iter()
+        .map(|info| info.inner_ty.clone())
+        .collect();
+    let drive_fn_names: Vec<_> = inputs.iter()
+        .map(|info| format_ident!("drive_{}", info.name))
         .collect();
     output.extend(Into::<TokenStream>::into(quote! {
         impl #impl_generics #struct_name #ty_generics #where_clause {
@@ -121,24 +134,18 @@ pub fn derive_module(tokens: TokenStream) -> TokenStream {
         }
     }));
 
-    // Outputs
-    let names: Vec<_> = field_info.iter()
-        .filter(|f| f.kind == FieldKind::Output)
-        .map(|f| f.name.clone())
-        .collect();
-    let types: Vec<_> = field_info.iter()
-        .filter(|f| f.kind == FieldKind::Output)
-        .map(|f| f.ty.clone())
-        .collect();
-    let inner_types: Vec<_> = field_info.iter()
-        .filter(|f| f.kind == FieldKind::Output)
-        .map(|f| f.inner_ty.clone())
-        .collect();
-
     // Automatically implement public methods for sampling output wires 
-    let sample_fn_names: Vec<_> = field_info.iter()
-        .filter(|f| f.kind == FieldKind::Output)
-        .map(|f| format_ident!("sample_{}", f.name))
+    let outputs: Vec<_> = module_fields.iter().filter_map(|field| {
+        if let ModuleField::Output(info) = field { Some(info) } else { None }
+    }).collect();
+    let names: Vec<_> = outputs.iter()
+        .map(|info| info.name.clone())
+        .collect();
+    let inner_types: Vec<_> = outputs.iter()
+        .map(|info| info.inner_ty.clone())
+        .collect();
+    let sample_fn_names: Vec<_> = outputs.iter()
+        .map(|info| format_ident!("sample_{}", info.name))
         .collect();
     output.extend(Into::<TokenStream>::into(quote! {
         impl #impl_generics #struct_name #ty_generics #where_clause {
@@ -149,7 +156,6 @@ pub fn derive_module(tokens: TokenStream) -> TokenStream {
             )*
         }
     }));
-
 
     //let output_type_name = format_ident!("{}_Outputs", struct_name);
     //output.extend(Into::<TokenStream>::into(quote! {
@@ -166,19 +172,14 @@ pub fn derive_module(tokens: TokenStream) -> TokenStream {
     //        }
     //    }
     //}));
-
-    // Registers
-    let names: Vec<_> = field_info.iter()
-        .filter(|f| f.kind == FieldKind::Clocked)
-        .map(|f| f.name.clone())
-        .collect();
-    let types: Vec<_> = field_info.iter()
-        .filter(|f| f.kind == FieldKind::Clocked)
-        .map(|f| f.ty.clone())
-        .collect();
-
+  
     // Automatically implement a function which propagates a simulated clock
     // edge to all members that have been marked as 'clocked'.
+    let clocked: Vec<_> = module_fields.iter().filter_map(|field| {
+        if let ModuleField::Clocked(info) = field { Some(info) } else { None }
+    }).collect();
+
+    let names: Vec<_> = clocked.iter().map(|info| info.name.clone()).collect();
     output.extend(Into::<TokenStream>::into(quote! {
         impl #impl_generics Clocked for #struct_name #ty_generics #where_clause {
             fn sim_clock_edge(&mut self) {
@@ -187,6 +188,10 @@ pub fn derive_module(tokens: TokenStream) -> TokenStream {
             }
         }
     }));
+
+    //let submodules: Vec<_> = module_fields.iter().filter_map(|field| {
+    //    if let ModuleField::Submodule(info) = field { Some(info) } else { None }
+    //}).collect();
 
     output.into()
 }
