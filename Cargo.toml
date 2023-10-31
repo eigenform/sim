@@ -1,0 +1,6 @@
+[workspace]
+members = [
+	"sim",
+	"sim-macros",
+	"sim-test",
+]
